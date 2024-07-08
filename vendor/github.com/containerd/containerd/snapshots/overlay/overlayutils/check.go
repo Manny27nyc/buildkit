@@ -1,3 +1,4 @@
+//go:build linux
 // +build linux
 
 /*
@@ -20,15 +21,20 @@ package overlayutils
 
 import (
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
+	"syscall"
 
+	kernel "github.com/containerd/containerd/contrib/seccomp/kernelversion"
 	"github.com/containerd/containerd/log"
 	"github.com/containerd/containerd/mount"
 	"github.com/containerd/containerd/pkg/userns"
 	"github.com/containerd/continuity/fs"
-	"github.com/pkg/errors"
+)
+
+const (
+	// see https://man7.org/linux/man-pages/man2/statfs.2.html
+	tmpfsMagic = 0x01021994
 )
 
 // SupportsMultipleLowerDir checks if the system supports multiple lowerdirs,
@@ -39,7 +45,7 @@ import (
 //
 // Ported from moby overlay2.
 func SupportsMultipleLowerDir(d string) error {
-	td, err := ioutil.TempDir(d, "multiple-lowerdir-check")
+	td, err := os.MkdirTemp(d, "multiple-lowerdir-check")
 	if err != nil {
 		return err
 	}
@@ -63,7 +69,7 @@ func SupportsMultipleLowerDir(d string) error {
 	}
 	dest := filepath.Join(td, "merged")
 	if err := m.Mount(dest); err != nil {
-		return errors.Wrap(err, "failed to mount overlay")
+		return fmt.Errorf("failed to mount overlay: %w", err)
 	}
 	if err := mount.UnmountAll(dest, 0); err != nil {
 		log.L.WithError(err).Warnf("Failed to unmount check directory %v", dest)
@@ -86,6 +92,21 @@ func Supported(root string) error {
 		return fmt.Errorf("%s does not support d_type. If the backing filesystem is xfs, please reformat with ftype=1 to enable d_type support", root)
 	}
 	return SupportsMultipleLowerDir(root)
+}
+
+// IsPathOnTmpfs returns whether the path is on a tmpfs or not.
+//
+// It uses statfs to check if the fs type is TMPFS_MAGIC (0x01021994)
+// see https://man7.org/linux/man-pages/man2/statfs.2.html
+func IsPathOnTmpfs(d string) bool {
+	stat := syscall.Statfs_t{}
+	err := syscall.Statfs(d, &stat)
+	if err != nil {
+		log.L.WithError(err).Warnf("Could not retrieve statfs for %v", d)
+		return false
+	}
+
+	return stat.Type == tmpfsMagic
 }
 
 // NeedsUserXAttr returns whether overlayfs should be mounted with the "userxattr" mount option.
@@ -114,10 +135,19 @@ func NeedsUserXAttr(d string) (bool, error) {
 		return false, nil
 	}
 
-	// TODO: add fast path for kernel >= 5.11 .
+	// userxattr not permitted on tmpfs https://man7.org/linux/man-pages/man5/tmpfs.5.html
+	if IsPathOnTmpfs(d) {
+		return false, nil
+	}
+
+	// Fast path on kernels >= 5.11
 	//
-	// Keep in mind that distro vendors might be going to backport the patch to older kernels.
-	// So we can't completely remove the check.
+	// Keep in mind that distro vendors might be going to backport the patch to older kernels
+	// so we can't completely remove the "slow path".
+	fiveDotEleven := kernel.KernelVersion{Kernel: 5, Major: 11}
+	if ok, err := kernel.GreaterEqualThan(fiveDotEleven); err == nil && ok {
+		return true, nil
+	}
 
 	tdRoot := filepath.Join(d, "userxattr-check")
 	if err := os.RemoveAll(tdRoot); err != nil {
@@ -134,7 +164,7 @@ func NeedsUserXAttr(d string) (bool, error) {
 		}
 	}()
 
-	td, err := ioutil.TempDir(tdRoot, "")
+	td, err := os.MkdirTemp(tdRoot, "")
 	if err != nil {
 		return false, err
 	}
@@ -146,6 +176,7 @@ func NeedsUserXAttr(d string) (bool, error) {
 	}
 
 	opts := []string{
+		"ro",
 		fmt.Sprintf("lowerdir=%s:%s,upperdir=%s,workdir=%s", filepath.Join(td, "lower2"), filepath.Join(td, "lower1"), filepath.Join(td, "upper"), filepath.Join(td, "work")),
 		"userxattr",
 	}
